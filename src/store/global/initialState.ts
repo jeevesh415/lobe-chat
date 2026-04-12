@@ -50,11 +50,13 @@ export enum SettingsTabs {
   /** @deprecated Use Appearance instead */
   Common = 'common',
   Credits = 'credits',
+  Creds = 'creds',
   Hotkey = 'hotkey',
   /** @deprecated Use ServiceModel instead */
   Image = 'image',
   LLM = 'llm',
   Memory = 'memory',
+  Notification = 'notification',
   // business
   Plans = 'plans',
   Profile = 'profile',
@@ -97,6 +99,11 @@ export interface SystemStatus {
   chatInputHeight?: number;
   disabledModelProvidersSortType?: string;
   disabledModelsSortType?: string;
+  /**
+   * IDs of banners/ads the user has dismissed. New banners use a new ID
+   * so dismissing the current one does not hide future ones.
+   */
+  dismissedBannerIds?: string[];
   expandInputActionbar?: boolean;
   // which sessionGroup should expand
   expandSessionGroupKeys: string[];
@@ -108,11 +115,16 @@ export interface SystemStatus {
    * Group Agent Builder panel width
    */
   groupAgentBuilderPanelWidth?: number;
+  /**
+   * Hidden sidebar sections
+   */
+  hiddenSidebarSections?: string[];
   hidePWAInstaller?: boolean;
   hideThreadLimitAlert?: boolean;
   hideTopicSharePrivacyWarning?: boolean;
   imagePanelWidth: number;
   imageTopicPanelWidth?: number;
+  imageTopicViewMode?: 'grid' | 'list';
   /**
    * Do not enable PGLite on app initialization, only enable when user manually turns it on
    */
@@ -151,6 +163,10 @@ export interface SystemStatus {
   portalWidth: number;
   readNotificationSlugs?: string[];
   /**
+   * number of recent items to display
+   */
+  recentPageSize?: number;
+  /**
    * Resource Manager column widths
    */
   resourceManagerColumnWidths?: {
@@ -168,6 +184,10 @@ export interface SystemStatus {
   showSystemRole?: boolean;
   showVideoPanel?: boolean;
   showVideoTopicPanel?: boolean;
+  /**
+   * Order of sidebar sections (e.g. ['recents', 'agent'])
+   */
+  sidebarSectionOrder?: string[];
   systemRoleExpandedMap: Record<string, boolean>;
   /**
    * Whether to display tokens in short format
@@ -179,6 +199,7 @@ export interface SystemStatus {
   topicPageSize?: number;
   videoPanelWidth: number;
   videoTopicPanelWidth?: number;
+  videoTopicViewMode?: 'grid' | 'list';
   zenMode?: boolean;
 }
 
@@ -216,10 +237,12 @@ export interface GlobalState {
 
 export const INITIAL_STATUS = {
   agentBuilderPanelWidth: 360,
-  agentPageSize: 10,
+  agentPageSize: 5,
   chatInputHeight: 64,
+  recentPageSize: 5,
   disabledModelProvidersSortType: 'default',
   disabledModelsSortType: 'default',
+  dismissedBannerIds: [],
   expandInputActionbar: true,
   expandSessionGroupKeys: [SessionDefaultGroup.Pinned, SessionDefaultGroup.Default],
   fileManagerViewMode: 'list' as const,
@@ -229,6 +252,7 @@ export const INITIAL_STATUS = {
   hideThreadLimitAlert: false,
   hideTopicSharePrivacyWarning: false,
   imagePanelWidth: 320,
+  imageTopicViewMode: 'grid' as const,
   imageTopicPanelWidth: 80,
   knowledgeBaseModalViewMode: 'list' as const,
   leftPanelWidth: 320,
@@ -259,6 +283,7 @@ export const INITIAL_STATUS = {
   tokenDisplayFormatShort: true,
   topicPageSize: 20,
   videoPanelWidth: 320,
+  videoTopicViewMode: 'grid' as const,
   videoTopicPanelWidth: 80,
   zenMode: false,
 } satisfies SystemStatus;

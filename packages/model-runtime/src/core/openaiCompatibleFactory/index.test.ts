@@ -634,6 +634,7 @@ describe('LobeOpenAICompatibleFactory', () => {
               status: 400,
             },
             errorType: bizErrorType,
+            message: expect.any(String),
             provider,
           });
         }
@@ -672,6 +673,7 @@ describe('LobeOpenAICompatibleFactory', () => {
               cause: { message: 'api is undefined' },
             },
             errorType: bizErrorType,
+            message: expect.any(String),
             provider,
           });
         }
@@ -706,6 +708,7 @@ describe('LobeOpenAICompatibleFactory', () => {
               cause: { message: 'api is undefined' },
             },
             errorType: bizErrorType,
+            message: expect.any(String),
             provider,
           });
         }
@@ -784,6 +787,7 @@ describe('LobeOpenAICompatibleFactory', () => {
               status: 400,
             },
             errorType: AgentRuntimeErrorType.InsufficientQuota,
+            message: expect.any(String),
             provider,
           });
         }
@@ -822,6 +826,7 @@ describe('LobeOpenAICompatibleFactory', () => {
               status: 400,
             },
             errorType: AgentRuntimeErrorType.ExceededContextWindow,
+            message: expect.any(String),
             provider,
           });
         }
@@ -858,6 +863,7 @@ describe('LobeOpenAICompatibleFactory', () => {
               status: 429,
             },
             errorType: AgentRuntimeErrorType.QuotaLimitReached,
+            message: expect.any(String),
             provider,
           });
         }
@@ -885,6 +891,7 @@ describe('LobeOpenAICompatibleFactory', () => {
               name: genericError.name,
             },
             errorType: 'AgentRuntimeError',
+            message: expect.any(String),
             provider,
           });
         }
@@ -949,7 +956,7 @@ describe('LobeOpenAICompatibleFactory', () => {
     it('should use custom stream handler when provided', async () => {
       // Create a custom stream handler that handles both ReadableStream and OpenAI Stream
       const customStreamHandler = vi.fn(
-        (stream: ReadableStream | Stream<OpenAI.ChatCompletionChunk>) => {
+        (stream: ReadableStream | Stream<OpenAI.ChatCompletionChunk>, _options?: any) => {
           const readableStream =
             stream instanceof ReadableStream ? stream : stream.toReadableStream();
           return new ReadableStream({
@@ -1009,6 +1016,13 @@ describe('LobeOpenAICompatibleFactory', () => {
       await instance.chat(payload);
 
       expect(customStreamHandler).toHaveBeenCalled();
+
+      // Verify payload is passed to custom stream handler
+      const handlerOptions = customStreamHandler.mock.calls[0][1];
+      expect(handlerOptions.payload).toMatchObject({
+        model: 'test-model',
+        provider: ModelProvider.OpenAI,
+      });
     });
 
     it('should use custom transform handler for non-streaming response', async () => {
@@ -1874,7 +1888,7 @@ describe('LobeOpenAICompatibleFactory', () => {
 
       const payload = {
         messages: [{ content: 'Generate data', role: 'user' as const }],
-        model: 'gpt-5-mini',
+        model: 'gpt-5.4-mini',
         responseApi: true,
         schema: {
           name: 'test_tool',
@@ -1892,6 +1906,7 @@ describe('LobeOpenAICompatibleFactory', () => {
           status: 400,
         },
         errorType: AgentRuntimeErrorType.ExceededContextWindow,
+        message: expect.any(String),
         provider,
       });
     });

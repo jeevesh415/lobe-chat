@@ -3,13 +3,20 @@ import debug from 'debug';
 import { AgentBotProviderModel } from '@/database/models/agentBotProvider';
 import { TopicModel } from '@/database/models/topic';
 import { type LobeChatDatabase } from '@/database/type';
+import { getAgentRuntimeRedisClient } from '@/server/modules/AgentRuntime/redis';
 import { KeyVaultsGateKeeper } from '@/server/modules/KeyVaultsEncrypt';
 import { SystemAgentService } from '@/server/services/systemAgent';
 
-import { getPlatformDescriptor } from './platforms';
-import { DiscordRestApi } from './platforms/discord';
-import { renderError, renderFinalReply, renderStepProgress, splitMessage } from './replyTemplate';
-import type { PlatformMessenger } from './types';
+import { AgentBridgeService } from './AgentBridgeService';
+import type { BotProviderConfig, PlatformClient, PlatformMessenger, UsageStats } from './platforms';
+import { mergeWithDefaults, platformRegistry } from './platforms';
+import {
+  renderError,
+  renderFinalReply,
+  renderStepProgress,
+  renderStopped,
+  splitMessage,
+} from './replyTemplate';
 
 const log = debug('lobe-server:bot:callback');
 
@@ -23,18 +30,23 @@ export interface BotCallbackBody {
   elapsedMs?: number;
   errorMessage?: string;
   executionTimeMs?: number;
+  /** Hook ID from HookDispatcher (e.g. 'bot-step-progress', 'bot-completion') */
+  hookId?: string;
+  /** Hook type from HookDispatcher (e.g. 'afterStep', 'onComplete') */
+  hookType?: string;
   lastAssistantContent?: string;
   lastLLMContent?: string;
   lastToolsCalling?: any;
   llmCalls?: number;
   platformThreadId: string;
-  progressMessageId: string;
-  reactionChannelId?: string;
+  progressMessageId?: string;
   reason?: string;
   reasoning?: string;
   shouldContinue?: boolean;
   stepType?: 'call_llm' | 'call_tool';
   thinking?: boolean;
+  /** Thread name from the platform (e.g. Discord thread title) */
+  threadName?: string;
   toolCalls?: number;
   toolsCalling?: any;
   toolsResult?: any;
@@ -64,17 +76,33 @@ export class BotCallbackService {
     const { type, applicationId, platformThreadId, progressMessageId } = body;
     const platform = platformThreadId.split(':')[0];
 
-    const { botToken, messenger, charLimit } = await this.createMessenger(
+    const { client, messenger, charLimit, settings } = await this.createMessenger(
       platform,
       applicationId,
       platformThreadId,
     );
 
+    const entry = platformRegistry.getPlatform(platform);
+    const canEdit = entry?.supportsMessageEdit !== false;
+
     if (type === 'step') {
-      await this.handleStep(body, messenger, progressMessageId, platform);
+      if (canEdit && progressMessageId && settings.displayToolCalls !== false) {
+        await this.handleStep(body, messenger, progressMessageId, client);
+      }
     } else if (type === 'completion') {
-      await this.handleCompletion(body, messenger, progressMessageId, platform, charLimit);
-      await this.removeEyesReaction(body, messenger, botToken, platform, platformThreadId);
+      await this.handleCompletion(
+        body,
+        messenger,
+        progressMessageId ?? '',
+        client,
+        charLimit,
+        canEdit,
+      );
+      await this.removeEyesReaction(body, client, platformThreadId);
+      // Clear the active thread tracker so the thread can accept new messages.
+      // In queue mode, the bridge handler's finally block skips this cleanup
+      // to keep the thread marked active while the agent runs on the job queue.
+      AgentBridgeService.clearActiveThread(platformThreadId);
       this.summarizeTopicTitle(body, messenger);
     }
   }
@@ -83,7 +111,12 @@ export class BotCallbackService {
     platform: string,
     applicationId: string,
     platformThreadId: string,
-  ): Promise<{ botToken: string; charLimit?: number; messenger: PlatformMessenger }> {
+  ): Promise<{
+    charLimit?: number;
+    client: PlatformClient;
+    messenger: PlatformMessenger;
+    settings: Record<string, unknown>;
+  }> {
     const row = await AgentBotProviderModel.findByPlatformAndAppId(
       this.db,
       platform,
@@ -102,38 +135,44 @@ export class BotCallbackService {
       credentials = JSON.parse(row.credentials);
     }
 
-    const descriptor = getPlatformDescriptor(platform);
-    if (!descriptor) {
+    const entry = platformRegistry.getPlatform(platform);
+    if (!entry) {
       throw new Error(`Unsupported platform: ${platform}`);
     }
 
-    const missingCreds = descriptor.requiredCredentials.filter((k) => !credentials[k]);
-    if (missingCreds.length > 0) {
-      throw new Error(`Bot credentials incomplete for ${platform} appId=${applicationId}`);
-    }
+    const rawSettings = (row as any).settings as Record<string, unknown> | undefined;
+    const settings = mergeWithDefaults(entry.schema, rawSettings);
+    const charLimit = (settings.charLimit as number) || undefined;
 
-    return {
-      botToken: credentials.botToken || credentials.appId,
-      charLimit: descriptor.charLimit,
-      messenger: descriptor.createMessenger(credentials, platformThreadId),
+    const config: BotProviderConfig = {
+      applicationId,
+      credentials,
+      platform,
+      settings,
     };
+
+    const client = entry.clientFactory.createClient(config, {
+      redisClient: getAgentRuntimeRedisClient() as any,
+    });
+    const messenger = client.getMessenger(platformThreadId);
+
+    return { charLimit, client, messenger, settings };
   }
 
   private async handleStep(
     body: BotCallbackBody,
     messenger: PlatformMessenger,
     progressMessageId: string,
-    platform: string,
+    client: PlatformClient,
   ): Promise<void> {
     if (!body.shouldContinue) return;
 
-    const progressText = renderStepProgress({
+    const msgBody = renderStepProgress({
       content: body.content,
       elapsedMs: body.elapsedMs,
       executionTimeMs: body.executionTimeMs ?? 0,
       lastContent: body.lastLLMContent,
       lastToolsCalling: body.lastToolsCalling,
-      platform,
       reasoning: body.reasoning,
       stepType: body.stepType ?? ('call_llm' as const),
       thinking: body.thinking ?? false,
@@ -146,6 +185,15 @@ export class BotCallbackService {
       totalTokens: body.totalTokens ?? 0,
       totalToolCalls: body.totalToolCalls,
     });
+
+    const stats: UsageStats = {
+      elapsedMs: body.elapsedMs,
+      totalCost: body.totalCost ?? 0,
+      totalTokens: body.totalTokens ?? 0,
+    };
+
+    const formatted = client.formatMarkdown?.(msgBody) ?? msgBody;
+    const progressText = client.formatReply?.(formatted, stats) ?? formatted;
 
     const isLlmFinalResponse =
       body.stepType === 'call_llm' && !body.toolsCalling?.length && body.content;
@@ -164,17 +212,32 @@ export class BotCallbackService {
     body: BotCallbackBody,
     messenger: PlatformMessenger,
     progressMessageId: string,
-    platform: string,
+    client: PlatformClient,
     charLimit?: number,
+    canEdit = true,
   ): Promise<void> {
     const { reason, lastAssistantContent, errorMessage } = body;
 
     if (reason === 'error') {
       const errorText = renderError(errorMessage || 'Agent execution failed');
       try {
-        await messenger.editMessage(progressMessageId, errorText);
+        if (canEdit && progressMessageId) {
+          await messenger.editMessage(progressMessageId, errorText);
+        } else {
+          await messenger.createMessage(errorText);
+        }
       } catch (error) {
-        log('handleCompletion: failed to edit error message: %O', error);
+        log('handleCompletion: failed to send error message: %O', error);
+      }
+      return;
+    }
+
+    if (reason === 'interrupted') {
+      const stoppedText = renderStopped(errorMessage || 'Execution stopped.');
+      try {
+        await messenger.createMessage(stoppedText);
+      } catch (error) {
+        log('handleCompletion: failed to send interrupted message: %O', error);
       }
       return;
     }
@@ -184,55 +247,85 @@ export class BotCallbackService {
       return;
     }
 
-    const finalText = renderFinalReply(lastAssistantContent, {
+    const msgBody = renderFinalReply(lastAssistantContent);
+
+    const stats: UsageStats = {
       elapsedMs: body.duration,
       llmCalls: body.llmCalls ?? 0,
-      platform,
       toolCalls: body.toolCalls ?? 0,
       totalCost: body.cost ?? 0,
       totalTokens: body.totalTokens ?? 0,
-    });
+    };
 
+    const formattedBody = client.formatMarkdown?.(msgBody) ?? msgBody;
+    const finalText = client.formatReply?.(formattedBody, stats) ?? formattedBody;
     const chunks = splitMessage(finalText, charLimit);
 
     try {
-      await messenger.editMessage(progressMessageId, chunks[0]);
-      for (let i = 1; i < chunks.length; i++) {
-        await messenger.createMessage(chunks[i]);
+      if (canEdit && progressMessageId) {
+        await messenger.editMessage(progressMessageId, chunks[0]);
+        for (let i = 1; i < chunks.length; i++) {
+          await messenger.createMessage(chunks[i]);
+        }
+      } else {
+        // No progress message to edit or platform doesn't support edit — send all chunks as new messages
+        for (const chunk of chunks) {
+          await messenger.createMessage(chunk);
+        }
       }
     } catch (error) {
-      log('handleCompletion: failed to edit/post final message: %O', error);
+      log('handleCompletion: failed to send final message: %O', error);
     }
   }
 
   private async removeEyesReaction(
     body: BotCallbackBody,
-    messenger: PlatformMessenger,
-    botToken: string,
-    platform: string,
+    client: PlatformClient,
     platformThreadId: string,
   ): Promise<void> {
-    const { userMessageId, reactionChannelId } = body;
+    const { userMessageId } = body;
     if (!userMessageId) return;
 
+    // Thread-starter messages may live in the parent channel (e.g. Discord),
+    // so resolve the correct thread ID before obtaining the messenger.
+    const reactionThreadId =
+      client.resolveReactionThreadId?.(platformThreadId, userMessageId) ?? platformThreadId;
+    const messenger = client.getMessenger(reactionThreadId);
+
     try {
-      if (platform === 'discord') {
-        // Use reactionChannelId (parent channel for mentions, thread for follow-ups)
-        const descriptor = getPlatformDescriptor(platform)!;
-        const discord = new DiscordRestApi(botToken);
-        const targetChannelId = reactionChannelId || descriptor.extractChatId(platformThreadId);
-        await discord.removeOwnReaction(targetChannelId, userMessageId, '👀');
-      } else {
-        await messenger.removeReaction(userMessageId, '👀');
-      }
+      await messenger.removeReaction(userMessageId, '👀');
     } catch (error) {
       log('removeEyesReaction: failed: %O', error);
     }
   }
 
   private summarizeTopicTitle(body: BotCallbackBody, messenger: PlatformMessenger): void {
-    const { reason, topicId, userId, userPrompt, lastAssistantContent } = body;
-    if (reason === 'error' || !topicId || !userId || !userPrompt || !lastAssistantContent) return;
+    const { reason, topicId, userId, userPrompt, lastAssistantContent, threadName } = body;
+    if (
+      reason === 'error' ||
+      reason === 'interrupted' ||
+      !topicId ||
+      !userId ||
+      !userPrompt ||
+      !lastAssistantContent
+    ) {
+      return;
+    }
+
+    // Thread already has a user-set name — use it as topic title, skip LLM generation
+    if (threadName) {
+      const topicModel = new TopicModel(this.db, userId);
+      topicModel
+        .findById(topicId)
+        .then(async (topic) => {
+          if (topic?.title) return;
+          await topicModel.update(topicId, { title: threadName });
+        })
+        .catch((error) => {
+          log('summarizeTopicTitle: failed to set thread name as topic title: %O', error);
+        });
+      return;
+    }
 
     const topicModel = new TopicModel(this.db, userId);
     topicModel
