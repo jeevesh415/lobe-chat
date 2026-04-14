@@ -223,6 +223,7 @@ export class AiAgentService {
       appContext,
       autoStart = true,
       botContext,
+      clientRuntime,
       deviceId: requestedDeviceId,
       botPlatformContext,
       discordContext,
@@ -565,6 +566,7 @@ export class AiAgentService {
           chatConfig: agentConfig.chatConfig ?? undefined,
           plugins: agentPlugins,
         },
+        clientRuntime,
         deviceContext: gatewayConfigured
           ? {
               autoActivated: activeDeviceId ? true : undefined,
@@ -588,6 +590,9 @@ export class AiAgentService {
         LocalSystemManifest.identifier,
         RemoteDeviceManifest.identifier,
         ...(isBotConversation ? [MessageToolIdentifier] : []),
+        // Include LobeHub Skills and Klavis tools so they are passed to generateToolsDetailed
+        ...lobehubSkillManifests.map((m) => m.identifier),
+        ...klavisManifests.map((m) => m.identifier),
       ];
       log('execAgent: agent configured plugins: %O', pluginIds);
 
@@ -614,6 +619,35 @@ export class AiAgentService {
       }
       for (const manifest of klavisManifests) {
         toolSourceMap[manifest.identifier] = 'klavis';
+      }
+
+      // Mark tools that must run on the client (desktop Electron) because they
+      // require local IPC / subprocess capabilities:
+      //   - local-system builtin: Electron IPC for file + command execution
+      //   - stdio MCP plugins: subprocess lives on the user's machine
+      //
+      // Two triggers, in priority order:
+      //  (a) `clientRuntime === 'desktop'` — the caller itself is an Electron
+      //      client on the Agent Gateway WS and is ready to receive
+      //      `tool_execute`. This is the Phase 6.4 path and is authoritative
+      //      regardless of whether DEVICE_GATEWAY (the legacy device-proxy) is
+      //      also configured.
+      //  (b) `!gatewayConfigured` — no DEVICE_GATEWAY configured on the server,
+      //      so legacy Remote Device proxy isn't an option and any client
+      //      tooling falls through to the Gateway WS (standalone Electron).
+      //
+      // When DEVICE_GATEWAY is configured AND the caller is a web client, we
+      // leave executor unset so tools route via RemoteDevice proxy.
+      const shouldDispatchToClient = clientRuntime === 'desktop' || !gatewayConfigured;
+      if (shouldDispatchToClient) {
+        if (manifestMap.has(LocalSystemManifest.identifier)) {
+          toolExecutorMap[LocalSystemManifest.identifier] = 'client';
+        }
+        for (const plugin of installedPlugins) {
+          if (plugin.customParams?.mcp?.type === 'stdio' && manifestMap.has(plugin.identifier)) {
+            toolExecutorMap[plugin.identifier] = 'client';
+          }
+        }
       }
 
       log(
