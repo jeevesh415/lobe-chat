@@ -485,9 +485,19 @@ export class MarketService {
       const err = error as Error;
       console.error('MarketService.executeLobehubSkill error %s/%s: %O', provider, toolName, err);
 
+      // MarketAPIError carries the full error response body from the API,
+      // including structured details (command, exitCode, stdout, stderr).
+      // Extract it so the content is not empty on failure.
+      const errorBody = (err as any).errorBody;
+      const skillError = errorBody?.error;
+      const content = skillError ? JSON.stringify(skillError) : err.message;
+
       return {
-        content: err.message,
-        error: { code: 'LOBEHUB_SKILL_ERROR', message: err.message },
+        content,
+        error: {
+          code: skillError?.code || 'LOBEHUB_SKILL_ERROR',
+          message: skillError?.message || err.message,
+        },
         success: false,
       };
     }
@@ -532,12 +542,13 @@ export class MarketService {
             github: 'GitHub',
             linear: 'Linear',
             microsoft: 'Outlook Calendar',
+            notion: 'Notion',
             twitter: 'X (Twitter)',
             vercel: 'Vercel',
           };
           const providerLabel = PROVIDER_LABELS[providerId] || providerId;
 
-          const { tools } = await this.market.skills.listTools(providerId);
+          const { tools, instruction } = await this.market.skills.listTools(providerId);
           if (!tools || tools.length === 0) continue;
 
           const manifest: LobeToolManifest = {
@@ -553,6 +564,7 @@ export class MarketService {
               tags: ['lobehub-skill', providerId],
               title: providerLabel,
             },
+            systemRole: instruction || undefined,
             type: 'builtin',
           };
 

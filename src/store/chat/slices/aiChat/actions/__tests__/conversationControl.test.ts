@@ -1,4 +1,4 @@
-import { type ConversationContext } from '@lobechat/types';
+import { type ConversationContext, RequestTrigger } from '@lobechat/types';
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -25,6 +25,20 @@ vi.mock('@/services/agentRuntime', () => ({
     handleHumanIntervention: vi.fn().mockResolvedValue({ success: true }),
   },
 }));
+
+vi.mock('@/utils/localStorage', () => {
+  class AsyncLocalStorage<State> {
+    async getFromLocalStorage(): Promise<State> {
+      return {} as State;
+    }
+
+    async saveToLocalStorage(): Promise<void> {
+      return undefined;
+    }
+  }
+
+  return { AsyncLocalStorage };
+});
 
 beforeEach(() => {
   resetTestEnvironment();
@@ -476,9 +490,7 @@ describe('ConversationControl actions', () => {
       });
 
       // Mock internal methods
-      const optimisticUpdatePluginSpy = vi
-        .spyOn(result.current, 'optimisticUpdateMessagePlugin')
-        .mockResolvedValue(undefined);
+      vi.spyOn(result.current, 'optimisticUpdateMessagePlugin').mockResolvedValue(undefined);
       const internal_createAgentStateSpy = vi
         .spyOn(result.current, 'internal_createAgentState')
         .mockReturnValue({
@@ -486,8 +498,8 @@ describe('ConversationControl actions', () => {
           context: { phase: 'init' } as any,
           agentConfig: createMockResolvedAgentConfig(),
         });
-      const internal_execAgentRuntimeSpy = vi
-        .spyOn(result.current, 'internal_execAgentRuntime')
+      const executeClientAgentSpy = vi
+        .spyOn(result.current, 'executeClientAgent')
         .mockResolvedValue(undefined);
 
       // Call with builder context
@@ -509,8 +521,8 @@ describe('ConversationControl actions', () => {
         }),
       );
 
-      // Verify internal_execAgentRuntime was called with builder context (now wrapped in context object)
-      expect(internal_execAgentRuntimeSpy).toHaveBeenCalledWith(
+      // Verify executeClientAgent was called with builder context (now wrapped in context object)
+      expect(executeClientAgentSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           context: expect.objectContaining({
             agentId: builderAgentId,
@@ -559,8 +571,8 @@ describe('ConversationControl actions', () => {
           context: { phase: 'init' } as any,
           agentConfig: createMockResolvedAgentConfig(),
         });
-      const internal_execAgentRuntimeSpy = vi
-        .spyOn(result.current, 'internal_execAgentRuntime')
+      const executeClientAgentSpy = vi
+        .spyOn(result.current, 'executeClientAgent')
         .mockResolvedValue(undefined);
 
       // Call without context (should use global state)
@@ -576,8 +588,8 @@ describe('ConversationControl actions', () => {
         }),
       );
 
-      // Verify internal_execAgentRuntime was called with global context (now wrapped in context object)
-      expect(internal_execAgentRuntimeSpy).toHaveBeenCalledWith(
+      // Verify executeClientAgent was called with global context (now wrapped in context object)
+      expect(executeClientAgentSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           context: expect.objectContaining({
             agentId: globalAgentId,
@@ -599,16 +611,16 @@ describe('ConversationControl actions', () => {
         });
       });
 
-      const internal_execAgentRuntimeSpy = vi
-        .spyOn(result.current, 'internal_execAgentRuntime')
+      const executeClientAgentSpy = vi
+        .spyOn(result.current, 'executeClientAgent')
         .mockResolvedValue(undefined);
 
       await act(async () => {
         await result.current.approveToolCalling('non-existent-msg', 'group-1');
       });
 
-      // Should not call internal_execAgentRuntime when tool message not found
-      expect(internal_execAgentRuntimeSpy).not.toHaveBeenCalled();
+      // Should not call executeClientAgent when tool message not found
+      expect(executeClientAgentSpy).not.toHaveBeenCalled();
     });
 
     describe('server-mode branch', () => {
@@ -619,8 +631,19 @@ describe('ConversationControl actions', () => {
         const topicId = 'server-topic';
         const chatKey = messageMapKey({ agentId, topicId });
 
+        const onboardingUserMessage = createMockMessage({
+          id: 'onboarding-user-msg',
+          metadata: { trigger: RequestTrigger.Onboarding },
+          role: 'user',
+        });
+        const onboardingAssistantMessage = createMockMessage({
+          id: 'onboarding-assistant-msg',
+          parentId: onboardingUserMessage.id,
+          role: 'assistant',
+        });
         const toolMessage = createMockMessage({
           id: 'tool-msg-1',
+          parentId: onboardingAssistantMessage.id,
           plugin: {
             apiName: 'search',
             arguments: '{"q":"test"}',
@@ -637,12 +660,16 @@ describe('ConversationControl actions', () => {
           useChatStore.setState({
             activeAgentId: agentId,
             activeTopicId: topicId,
-            dbMessagesMap: { [chatKey]: [toolMessage] },
-            messagesMap: { [chatKey]: [toolMessage] },
+            dbMessagesMap: {
+              [chatKey]: [onboardingUserMessage, onboardingAssistantMessage, toolMessage],
+            },
+            messagesMap: {
+              [chatKey]: [onboardingUserMessage, onboardingAssistantMessage, toolMessage],
+            },
           });
 
-          // Simulate a running server operation — presence of this op is
-          // what flips approve/reject into server-mode.
+          // Presence of an `execServerAgentRuntime` op (any status) is one
+          // half of the Gateway-resume signal; the other is the lab flag.
           result.current.startOperation({
             context: { agentId, topicId, threadId: null },
             metadata: { serverOperationId: 'server-op-xyz' },
@@ -650,12 +677,13 @@ describe('ConversationControl actions', () => {
           });
         });
 
+        vi.spyOn(result.current, 'isGatewayModeEnabled').mockReturnValue(true);
         vi.spyOn(result.current, 'optimisticUpdateMessagePlugin').mockResolvedValue(undefined);
         const executeGatewayAgentSpy = vi
           .spyOn(result.current, 'executeGatewayAgent')
           .mockResolvedValue({} as any);
-        const internal_execAgentRuntimeSpy = vi
-          .spyOn(result.current, 'internal_execAgentRuntime')
+        const executeClientAgentSpy = vi
+          .spyOn(result.current, 'executeClientAgent')
           .mockResolvedValue(undefined);
 
         await act(async () => {
@@ -671,9 +699,150 @@ describe('ConversationControl actions', () => {
               parentMessageId: 'tool-msg-1',
               toolCallId: 'call_xyz',
             },
+            metadata: { trigger: RequestTrigger.Onboarding },
           }),
         );
-        expect(internal_execAgentRuntimeSpy).not.toHaveBeenCalled();
+        expect(executeClientAgentSpy).not.toHaveBeenCalled();
+
+        // Fallback guard: the paused `execServerAgentRuntime` op in this
+        // context must be completed so the loading state doesn't bleed
+        // across ops when the server-side `agent_runtime_end` for
+        // `waiting_for_human` hasn't landed yet.
+        const pausedServerOps = Object.values(result.current.operations).filter(
+          (op: any) => op.type === 'execServerAgentRuntime',
+        );
+        expect(pausedServerOps).toHaveLength(1);
+        expect(pausedServerOps[0]!.status).toBe('completed');
+
+        executeGatewayAgentSpy.mockRestore();
+      });
+
+      it('should still take the Gateway branch when the server already ended the paused op (post-coordinator-fix state)', async () => {
+        const { result } = renderHook(() => useChatStore());
+
+        const agentId = 'server-agent';
+        const topicId = 'server-topic';
+        const chatKey = messageMapKey({ agentId, topicId });
+
+        const toolMessage = createMockMessage({
+          id: 'tool-msg-1',
+          plugin: {
+            apiName: 'search',
+            arguments: '{"q":"test"}',
+            identifier: 'web-search',
+            type: 'default',
+          },
+          role: 'tool',
+          tool_call_id: 'call_xyz',
+        } as any);
+
+        let serverOpId: string | undefined;
+        act(() => {
+          useChatStore.setState({
+            activeAgentId: agentId,
+            activeTopicId: topicId,
+            dbMessagesMap: { [chatKey]: [toolMessage] },
+            messagesMap: { [chatKey]: [toolMessage] },
+          });
+
+          serverOpId = result.current.startOperation({
+            context: { agentId, topicId, threadId: null },
+            metadata: { serverOperationId: 'server-op-xyz' },
+            type: 'execServerAgentRuntime',
+          }).operationId;
+
+          // Simulate the coordinator's `waiting_for_human` → `agent_runtime_end`
+          // signal arriving before the user clicks approve: the op is already
+          // `completed` when the Gateway-branch decision runs.
+          result.current.completeOperation(serverOpId!);
+        });
+
+        expect(result.current.operations[serverOpId!]!.status).toBe('completed');
+
+        vi.spyOn(result.current, 'isGatewayModeEnabled').mockReturnValue(true);
+        vi.spyOn(result.current, 'optimisticUpdateMessagePlugin').mockResolvedValue(undefined);
+        const executeGatewayAgentSpy = vi
+          .spyOn(result.current, 'executeGatewayAgent')
+          .mockResolvedValue({} as any);
+        const executeClientAgentSpy = vi
+          .spyOn(result.current, 'executeClientAgent')
+          .mockResolvedValue(undefined);
+
+        await act(async () => {
+          await result.current.approveToolCalling('tool-msg-1', 'group-1');
+        });
+
+        // Critical regression guard: with `#hasRunningServerOp` the branch
+        // was missed here (no running op → fell through to client-mode).
+        // The combined `isGatewayModeEnabled() + any execServerAgentRuntime`
+        // check keeps us on the Gateway path.
+        expect(executeGatewayAgentSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            resumeApproval: expect.objectContaining({
+              decision: 'approved',
+              toolCallId: 'call_xyz',
+            }),
+          }),
+        );
+        expect(executeClientAgentSpy).not.toHaveBeenCalled();
+
+        executeGatewayAgentSpy.mockRestore();
+      });
+
+      it('should leave the paused server op running when the Gateway resume call fails so retries stay on the server-mode path', async () => {
+        const { result } = renderHook(() => useChatStore());
+
+        const agentId = 'server-agent';
+        const topicId = 'server-topic';
+        const chatKey = messageMapKey({ agentId, topicId });
+
+        const toolMessage = createMockMessage({
+          id: 'tool-msg-1',
+          plugin: {
+            apiName: 'search',
+            arguments: '{"q":"test"}',
+            identifier: 'web-search',
+            type: 'default',
+          },
+          role: 'tool',
+          tool_call_id: 'call_xyz',
+        } as any);
+
+        act(() => {
+          useChatStore.setState({
+            activeAgentId: agentId,
+            activeTopicId: topicId,
+            dbMessagesMap: { [chatKey]: [toolMessage] },
+            messagesMap: { [chatKey]: [toolMessage] },
+          });
+
+          result.current.startOperation({
+            context: { agentId, topicId, threadId: null },
+            metadata: { serverOperationId: 'server-op-xyz' },
+            type: 'execServerAgentRuntime',
+          });
+        });
+
+        vi.spyOn(result.current, 'isGatewayModeEnabled').mockReturnValue(true);
+        vi.spyOn(result.current, 'optimisticUpdateMessagePlugin').mockResolvedValue(undefined);
+        const executeGatewayAgentSpy = vi
+          .spyOn(result.current, 'executeGatewayAgent')
+          .mockRejectedValue(new Error('network error'));
+
+        await act(async () => {
+          await result.current.approveToolCalling('tool-msg-1', 'group-1');
+        });
+
+        expect(executeGatewayAgentSpy).toHaveBeenCalled();
+
+        // On failure, the paused server op must stay `running` — otherwise a
+        // retry would see no running server op and fall through to the
+        // non-Gateway path while the backend is still awaiting human input.
+        const serverOps = Object.values(result.current.operations).filter(
+          (op: any) => op.type === 'execServerAgentRuntime',
+        );
+        expect(serverOps).toHaveLength(1);
+        expect(serverOps[0]!.status).toBe('running');
 
         executeGatewayAgentSpy.mockRestore();
       });
@@ -710,8 +879,8 @@ describe('ConversationControl actions', () => {
         const executeGatewayAgentSpy = vi
           .spyOn(result.current, 'executeGatewayAgent')
           .mockResolvedValue({} as any);
-        const internal_execAgentRuntimeSpy = vi
-          .spyOn(result.current, 'internal_execAgentRuntime')
+        const executeClientAgentSpy = vi
+          .spyOn(result.current, 'executeClientAgent')
           .mockResolvedValue(undefined);
 
         await act(async () => {
@@ -719,7 +888,7 @@ describe('ConversationControl actions', () => {
         });
 
         expect(executeGatewayAgentSpy).not.toHaveBeenCalled();
-        expect(internal_execAgentRuntimeSpy).toHaveBeenCalled();
+        expect(executeClientAgentSpy).toHaveBeenCalled();
 
         executeGatewayAgentSpy.mockRestore();
       });
@@ -762,12 +931,13 @@ describe('ConversationControl actions', () => {
           });
         });
 
+        vi.spyOn(result.current, 'isGatewayModeEnabled').mockReturnValue(true);
         vi.spyOn(result.current, 'optimisticUpdateMessagePlugin').mockResolvedValue(undefined);
         const executeGatewayAgentSpy = vi
           .spyOn(result.current, 'executeGatewayAgent')
           .mockResolvedValue({} as any);
-        const internal_execAgentRuntimeSpy = vi
-          .spyOn(result.current, 'internal_execAgentRuntime')
+        const executeClientAgentSpy = vi
+          .spyOn(result.current, 'executeClientAgent')
           .mockResolvedValue(undefined);
 
         await act(async () => {
@@ -785,7 +955,7 @@ describe('ConversationControl actions', () => {
             resumeApproval: expect.objectContaining({ decision: 'approved' }),
           }),
         );
-        expect(internal_execAgentRuntimeSpy).not.toHaveBeenCalled();
+        expect(executeClientAgentSpy).not.toHaveBeenCalled();
 
         executeGatewayAgentSpy.mockRestore();
       });
@@ -793,7 +963,7 @@ describe('ConversationControl actions', () => {
   });
 
   describe('rejectToolCalling server-mode branch', () => {
-    it('starts a new Gateway op with resumeApproval.decision=rejected', async () => {
+    it('starts a new Gateway op with resumeApproval.decision=rejected_continue (unified)', async () => {
       const { result } = renderHook(() => useChatStore());
 
       const agentId = 'server-agent';
@@ -821,6 +991,7 @@ describe('ConversationControl actions', () => {
         });
       });
 
+      vi.spyOn(result.current, 'isGatewayModeEnabled').mockReturnValue(true);
       vi.spyOn(result.current, 'optimisticUpdateMessagePlugin').mockResolvedValue(undefined);
       vi.spyOn(result.current, 'optimisticUpdateMessageContent').mockResolvedValue(undefined);
       const executeGatewayAgentSpy = vi
@@ -836,7 +1007,7 @@ describe('ConversationControl actions', () => {
           message: '',
           parentMessageId: 'tool-msg-1',
           resumeApproval: {
-            decision: 'rejected',
+            decision: 'rejected_continue',
             parentMessageId: 'tool-msg-1',
             rejectionReason: 'not appropriate',
             toolCallId: 'call_xyz',
@@ -877,13 +1048,14 @@ describe('ConversationControl actions', () => {
         });
       });
 
+      vi.spyOn(result.current, 'isGatewayModeEnabled').mockReturnValue(true);
       vi.spyOn(result.current, 'optimisticUpdateMessagePlugin').mockResolvedValue(undefined);
       vi.spyOn(result.current, 'optimisticUpdateMessageContent').mockResolvedValue(undefined);
       const executeGatewayAgentSpy = vi
         .spyOn(result.current, 'executeGatewayAgent')
         .mockResolvedValue({} as any);
-      const internal_execAgentRuntimeSpy = vi
-        .spyOn(result.current, 'internal_execAgentRuntime')
+      const executeClientAgentSpy = vi
+        .spyOn(result.current, 'executeClientAgent')
         .mockResolvedValue(undefined);
       // Ensure client rejectToolCalling is NOT invoked in server-mode path —
       // otherwise the server would see a duplicate halting `reject` before
@@ -908,7 +1080,7 @@ describe('ConversationControl actions', () => {
           },
         }),
       );
-      expect(internal_execAgentRuntimeSpy).not.toHaveBeenCalled();
+      expect(executeClientAgentSpy).not.toHaveBeenCalled();
       expect(rejectToolCallingSpy).not.toHaveBeenCalled();
 
       executeGatewayAgentSpy.mockRestore();
@@ -927,9 +1099,20 @@ describe('ConversationControl actions', () => {
         tone: 'Professional',
       };
 
+      const onboardingUserMessage = createMockMessage({
+        id: 'onboarding-user-msg',
+        metadata: { trigger: RequestTrigger.Onboarding },
+        role: 'user',
+      });
+      const onboardingAssistantMessage = createMockMessage({
+        id: 'onboarding-assistant-msg',
+        parentId: onboardingUserMessage.id,
+        role: 'assistant',
+      });
       const toolMessage = createMockMessage({
         groupId: 'group-1',
         id: 'tool-msg-1',
+        parentId: onboardingAssistantMessage.id,
         plugin: {
           apiName: 'askUserQuestion',
           arguments: '{}',
@@ -945,10 +1128,10 @@ describe('ConversationControl actions', () => {
           activeTopicId: topicId,
           activeThreadId: undefined,
           dbMessagesMap: {
-            [chatKey]: [toolMessage],
+            [chatKey]: [onboardingUserMessage, onboardingAssistantMessage, toolMessage],
           },
           messagesMap: {
-            [chatKey]: [toolMessage],
+            [chatKey]: [onboardingUserMessage, onboardingAssistantMessage, toolMessage],
           },
         });
       });
@@ -970,14 +1153,27 @@ describe('ConversationControl actions', () => {
 
           useChatStore.setState({
             dbMessagesMap: {
-              [chatKey]: [toolMessage, userMessage],
+              [chatKey]: [
+                onboardingUserMessage,
+                onboardingAssistantMessage,
+                toolMessage,
+                userMessage,
+              ],
             },
             messagesMap: {
-              [chatKey]: [toolMessage, userMessage],
+              [chatKey]: [
+                onboardingUserMessage,
+                onboardingAssistantMessage,
+                toolMessage,
+                userMessage,
+              ],
             },
           });
 
-          return { id: userMessageId, messages: [toolMessage, userMessage] };
+          return {
+            id: userMessageId,
+            messages: [onboardingUserMessage, onboardingAssistantMessage, toolMessage, userMessage],
+          };
         });
 
       const initialContext = { phase: 'init' } as any;
@@ -988,8 +1184,8 @@ describe('ConversationControl actions', () => {
           context: initialContext,
           state: {} as any,
         });
-      const internal_execAgentRuntimeSpy = vi
-        .spyOn(result.current, 'internal_execAgentRuntime')
+      const executeClientAgentSpy = vi
+        .spyOn(result.current, 'executeClientAgent')
         .mockResolvedValue(undefined);
 
       await act(async () => {
@@ -1000,6 +1196,7 @@ describe('ConversationControl actions', () => {
         expect.objectContaining({
           content: 'Writing documents, Professional',
           groupId: 'group-1',
+          metadata: { trigger: RequestTrigger.Onboarding },
           role: 'user',
         }),
         expect.objectContaining({ operationId: expect.any(String) }),
@@ -1015,11 +1212,182 @@ describe('ConversationControl actions', () => {
         }),
       );
 
-      expect(internal_execAgentRuntimeSpy).toHaveBeenCalledWith(
+      expect(executeClientAgentSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           initialContext,
+          metadata: { trigger: RequestTrigger.Onboarding },
           parentMessageId: userMessageId,
           parentMessageType: 'user',
+        }),
+      );
+    });
+
+    it('should preserve request trigger metadata when resuming from tool result only', async () => {
+      const { result } = renderHook(() => useChatStore());
+
+      const agentId = 'global-agent';
+      const topicId = 'global-topic';
+      const chatKey = messageMapKey({ agentId, topicId });
+      const response = {
+        templateId: 'onboarding-template',
+      };
+
+      const onboardingUserMessage = createMockMessage({
+        id: 'onboarding-user-msg',
+        metadata: { trigger: RequestTrigger.Onboarding },
+        role: 'user',
+      });
+      const onboardingAssistantMessage = createMockMessage({
+        id: 'onboarding-assistant-msg',
+        parentId: onboardingUserMessage.id,
+        role: 'assistant',
+      });
+      const toolMessage = createMockMessage({
+        groupId: 'group-1',
+        id: 'tool-msg-1',
+        parentId: onboardingAssistantMessage.id,
+        plugin: {
+          apiName: 'selectAgentTemplate',
+          arguments: '{}',
+          identifier: 'lobe-agent-marketplace',
+          type: 'default',
+        },
+        role: 'tool',
+      });
+
+      act(() => {
+        useChatStore.setState({
+          activeAgentId: agentId,
+          activeTopicId: topicId,
+          activeThreadId: undefined,
+          dbMessagesMap: {
+            [chatKey]: [onboardingUserMessage, onboardingAssistantMessage, toolMessage],
+          },
+          messagesMap: {
+            [chatKey]: [onboardingUserMessage, onboardingAssistantMessage, toolMessage],
+          },
+        });
+      });
+
+      vi.spyOn(result.current, 'optimisticUpdateMessagePlugin').mockResolvedValue(undefined);
+      vi.spyOn(result.current, 'optimisticUpdateMessageContent').mockResolvedValue(undefined);
+      vi.spyOn(result.current, 'optimisticCreateMessage');
+
+      const initialContext = { phase: 'init' } as any;
+      vi.spyOn(result.current, 'internal_createAgentState').mockReturnValue({
+        agentConfig: createMockResolvedAgentConfig(),
+        context: initialContext,
+        state: {} as any,
+      });
+      const executeClientAgentSpy = vi
+        .spyOn(result.current, 'executeClientAgent')
+        .mockResolvedValue(undefined);
+
+      await act(async () => {
+        await result.current.submitToolInteraction('tool-msg-1', response, undefined, {
+          createUserMessage: false,
+          toolResultContent: 'Selected onboarding template',
+        });
+      });
+
+      expect(result.current.optimisticCreateMessage).not.toHaveBeenCalled();
+      expect(executeClientAgentSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          initialContext: expect.objectContaining({
+            phase: 'tool_result',
+          }),
+          metadata: { trigger: RequestTrigger.Onboarding },
+          parentMessageId: 'tool-msg-1',
+          parentMessageType: 'tool',
+        }),
+      );
+    });
+
+    it('should not reuse onboarding trigger metadata from an older message outside the active tool chain', async () => {
+      const { result } = renderHook(() => useChatStore());
+
+      const agentId = 'global-agent';
+      const topicId = 'global-topic';
+      const chatKey = messageMapKey({ agentId, topicId });
+
+      const oldOnboardingMessage = createMockMessage({
+        id: 'old-onboarding-user-msg',
+        metadata: { trigger: RequestTrigger.Onboarding },
+        role: 'user',
+      });
+      const normalUserMessage = createMockMessage({
+        id: 'normal-user-msg',
+        role: 'user',
+      });
+      const normalAssistantMessage = createMockMessage({
+        id: 'normal-assistant-msg',
+        parentId: normalUserMessage.id,
+        role: 'assistant',
+      });
+      const normalToolMessage = createMockMessage({
+        id: 'normal-tool-msg',
+        parentId: normalAssistantMessage.id,
+        plugin: {
+          apiName: 'selectAgentTemplate',
+          arguments: '{}',
+          identifier: 'lobe-agent-marketplace',
+          type: 'default',
+        },
+        role: 'tool',
+      });
+
+      act(() => {
+        useChatStore.setState({
+          activeAgentId: agentId,
+          activeTopicId: topicId,
+          activeThreadId: undefined,
+          dbMessagesMap: {
+            [chatKey]: [
+              oldOnboardingMessage,
+              normalUserMessage,
+              normalAssistantMessage,
+              normalToolMessage,
+            ],
+          },
+          messagesMap: {
+            [chatKey]: [
+              oldOnboardingMessage,
+              normalUserMessage,
+              normalAssistantMessage,
+              normalToolMessage,
+            ],
+          },
+        });
+      });
+
+      vi.spyOn(result.current, 'optimisticUpdateMessagePlugin').mockResolvedValue(undefined);
+      vi.spyOn(result.current, 'optimisticUpdateMessageContent').mockResolvedValue(undefined);
+      vi.spyOn(result.current, 'internal_createAgentState').mockReturnValue({
+        agentConfig: createMockResolvedAgentConfig(),
+        context: { phase: 'init' } as any,
+        state: {} as any,
+      });
+      const executeClientAgentSpy = vi
+        .spyOn(result.current, 'executeClientAgent')
+        .mockResolvedValue(undefined);
+
+      await act(async () => {
+        await result.current.submitToolInteraction(
+          normalToolMessage.id,
+          { templateId: 'normal-template' },
+          undefined,
+          {
+            createUserMessage: false,
+            toolResultContent: 'Selected normal template',
+          },
+        );
+      });
+
+      expect(executeClientAgentSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: undefined,
+          parentMessageId: normalToolMessage.id,
+          parentMessageType: 'tool',
         }),
       );
     });
@@ -1034,9 +1402,20 @@ describe('ConversationControl actions', () => {
       const chatKey = messageMapKey({ agentId, topicId });
       const reason = 'Need to decide later';
 
+      const onboardingUserMessage = createMockMessage({
+        id: 'onboarding-user-msg',
+        metadata: { trigger: RequestTrigger.Onboarding },
+        role: 'user',
+      });
+      const onboardingAssistantMessage = createMockMessage({
+        id: 'onboarding-assistant-msg',
+        parentId: onboardingUserMessage.id,
+        role: 'assistant',
+      });
       const toolMessage = createMockMessage({
         groupId: 'group-1',
         id: 'tool-msg-1',
+        parentId: onboardingAssistantMessage.id,
         plugin: {
           apiName: 'askUserQuestion',
           arguments: '{}',
@@ -1052,10 +1431,10 @@ describe('ConversationControl actions', () => {
           activeTopicId: topicId,
           activeThreadId: undefined,
           dbMessagesMap: {
-            [chatKey]: [toolMessage],
+            [chatKey]: [onboardingUserMessage, onboardingAssistantMessage, toolMessage],
           },
           messagesMap: {
-            [chatKey]: [toolMessage],
+            [chatKey]: [onboardingUserMessage, onboardingAssistantMessage, toolMessage],
           },
         });
       });
@@ -1077,14 +1456,27 @@ describe('ConversationControl actions', () => {
 
           useChatStore.setState({
             dbMessagesMap: {
-              [chatKey]: [toolMessage, userMessage],
+              [chatKey]: [
+                onboardingUserMessage,
+                onboardingAssistantMessage,
+                toolMessage,
+                userMessage,
+              ],
             },
             messagesMap: {
-              [chatKey]: [toolMessage, userMessage],
+              [chatKey]: [
+                onboardingUserMessage,
+                onboardingAssistantMessage,
+                toolMessage,
+                userMessage,
+              ],
             },
           });
 
-          return { id: userMessageId, messages: [toolMessage, userMessage] };
+          return {
+            id: userMessageId,
+            messages: [onboardingUserMessage, onboardingAssistantMessage, toolMessage, userMessage],
+          };
         });
 
       const initialContext = { phase: 'init' } as any;
@@ -1095,8 +1487,8 @@ describe('ConversationControl actions', () => {
           context: initialContext,
           state: {} as any,
         });
-      const internal_execAgentRuntimeSpy = vi
-        .spyOn(result.current, 'internal_execAgentRuntime')
+      const executeClientAgentSpy = vi
+        .spyOn(result.current, 'executeClientAgent')
         .mockResolvedValue(undefined);
 
       await act(async () => {
@@ -1107,6 +1499,7 @@ describe('ConversationControl actions', () => {
         expect.objectContaining({
           content: `I'll skip this. ${reason}`,
           groupId: 'group-1',
+          metadata: { trigger: RequestTrigger.Onboarding },
           role: 'user',
         }),
         expect.objectContaining({ operationId: expect.any(String) }),
@@ -1122,9 +1515,118 @@ describe('ConversationControl actions', () => {
         }),
       );
 
-      expect(internal_execAgentRuntimeSpy).toHaveBeenCalledWith(
+      expect(executeClientAgentSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           initialContext,
+          metadata: { trigger: RequestTrigger.Onboarding },
+          parentMessageId: userMessageId,
+          parentMessageType: 'user',
+        }),
+      );
+    });
+
+    it('should preserve request trigger from raw messages when display messages are incomplete', async () => {
+      const { result } = renderHook(() => useChatStore());
+
+      const agentId = 'global-agent';
+      const topicId = 'global-topic';
+      const chatKey = messageMapKey({ agentId, topicId });
+
+      const onboardingUserMessage = createMockMessage({
+        id: 'onboarding-user-msg',
+        metadata: { trigger: RequestTrigger.Onboarding },
+        role: 'user',
+      });
+      const onboardingAssistantMessage = createMockMessage({
+        id: 'onboarding-assistant-msg',
+        parentId: onboardingUserMessage.id,
+        role: 'assistant',
+      });
+      const toolMessage = createMockMessage({
+        groupId: 'group-1',
+        id: 'tool-msg-1',
+        parentId: onboardingAssistantMessage.id,
+        plugin: {
+          apiName: 'showAgentMarketplace',
+          arguments: '{}',
+          identifier: 'lobe-web-onboarding',
+          type: 'default',
+        },
+        role: 'tool',
+      });
+
+      act(() => {
+        useChatStore.setState({
+          activeAgentId: agentId,
+          activeTopicId: topicId,
+          activeThreadId: undefined,
+          dbMessagesMap: {
+            [chatKey]: [onboardingUserMessage, onboardingAssistantMessage, toolMessage],
+          },
+          messagesMap: {
+            [chatKey]: [toolMessage],
+          },
+        });
+      });
+
+      vi.spyOn(result.current, 'optimisticUpdateMessagePlugin').mockResolvedValue(undefined);
+      vi.spyOn(result.current, 'optimisticUpdateMessageContent').mockResolvedValue(undefined);
+
+      const userMessageId = 'skipped-user-msg';
+      const optimisticCreateMessageSpy = vi
+        .spyOn(result.current, 'optimisticCreateMessage')
+        .mockImplementation(async (message) => {
+          const userMessage = createMockMessage({
+            content: message.content,
+            groupId: message.groupId,
+            id: userMessageId,
+            metadata: message.metadata,
+            role: 'user',
+            topicId,
+          });
+
+          useChatStore.setState({
+            dbMessagesMap: {
+              [chatKey]: [
+                onboardingUserMessage,
+                onboardingAssistantMessage,
+                toolMessage,
+                userMessage,
+              ],
+            },
+            messagesMap: {
+              [chatKey]: [toolMessage, userMessage],
+            },
+          });
+
+          return {
+            id: userMessageId,
+            messages: [onboardingUserMessage, onboardingAssistantMessage, toolMessage, userMessage],
+          };
+        });
+
+      vi.spyOn(result.current, 'internal_createAgentState').mockReturnValue({
+        agentConfig: createMockResolvedAgentConfig(),
+        context: { phase: 'init' } as any,
+        state: {} as any,
+      });
+      const executeClientAgentSpy = vi
+        .spyOn(result.current, 'executeClientAgent')
+        .mockResolvedValue(undefined);
+
+      await act(async () => {
+        await result.current.skipToolInteraction('tool-msg-1');
+      });
+
+      expect(optimisticCreateMessageSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: { trigger: RequestTrigger.Onboarding },
+        }),
+        expect.objectContaining({ operationId: expect.any(String) }),
+      );
+      expect(executeClientAgentSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: { trigger: RequestTrigger.Onboarding },
           parentMessageId: userMessageId,
           parentMessageType: 'user',
         }),
@@ -1179,8 +1681,8 @@ describe('ConversationControl actions', () => {
           context: { phase: 'init' } as any,
           agentConfig: createMockResolvedAgentConfig(),
         });
-      const internal_execAgentRuntimeSpy = vi
-        .spyOn(result.current, 'internal_execAgentRuntime')
+      const executeClientAgentSpy = vi
+        .spyOn(result.current, 'executeClientAgent')
         .mockResolvedValue(undefined);
 
       // Call with builder context
@@ -1202,8 +1704,8 @@ describe('ConversationControl actions', () => {
         }),
       );
 
-      // Verify internal_execAgentRuntime was called with builder context (now wrapped in context object)
-      expect(internal_execAgentRuntimeSpy).toHaveBeenCalledWith(
+      // Verify executeClientAgent was called with builder context (now wrapped in context object)
+      expect(executeClientAgentSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           context: expect.objectContaining({
             agentId: builderAgentId,
@@ -1253,8 +1755,8 @@ describe('ConversationControl actions', () => {
           context: { phase: 'init' } as any,
           agentConfig: createMockResolvedAgentConfig(),
         });
-      const internal_execAgentRuntimeSpy = vi
-        .spyOn(result.current, 'internal_execAgentRuntime')
+      const executeClientAgentSpy = vi
+        .spyOn(result.current, 'executeClientAgent')
         .mockResolvedValue(undefined);
 
       // Call without context
@@ -1270,8 +1772,8 @@ describe('ConversationControl actions', () => {
         }),
       );
 
-      // Verify internal_execAgentRuntime was called with global context
-      expect(internal_execAgentRuntimeSpy).toHaveBeenCalledWith(
+      // Verify executeClientAgent was called with global context
+      expect(executeClientAgentSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           context: expect.objectContaining({
             agentId: globalAgentId,

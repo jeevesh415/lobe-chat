@@ -20,6 +20,7 @@ import {
   type BotPlatformRuntimeContext,
   type BotProviderConfig,
   ClientFactory,
+  messengerContentText,
   type PlatformClient,
   type PlatformMessenger,
   type UsageStats,
@@ -61,9 +62,23 @@ function createMessenger(
   const api = new LarkApiClient(config.applicationId, config.credentials.appSecret, domain);
   const chatId = extractChatId(platformThreadId);
   return {
-    createMessage: (content) => api.sendMessage(chatId, content).then(() => {}),
-    editMessage: (messageId, content) => api.editMessage(messageId, content).then(() => {}),
+    addReaction: (messageId, emoji) => api.addReaction(messageId, emoji).then(() => {}),
+    // Attachments are silently dropped for now — Lark/Feishu outbound media
+    // is its own follow-up; reply text still ships.
+    createMessage: (content) =>
+      api.sendMessage(chatId, messengerContentText(content)).then(() => {}),
+    editMessage: (messageId, content) =>
+      api.editMessage(messageId, messengerContentText(content)).then(() => {}),
+    // Feishu / Lark currently expose no authenticated removeReaction endpoint.
+    // Callers should treat this as a best-effort no-op — step swaps will stack
+    // additions rather than clear the previous emoji.
     removeReaction: () => Promise.resolve(),
+    replaceReaction: async (messageId, prevEmoji, nextEmoji) => {
+      if (prevEmoji === nextEmoji) return;
+      // No remove API upstream — we can only add. Step swaps therefore stack
+      // emoji on the user's message. Final cleanup is a no-op.
+      if (nextEmoji) await api.addReaction(messageId, nextEmoji);
+    },
   };
 }
 

@@ -1,15 +1,64 @@
 import debug from 'debug';
 
+import type { MessengerPlatform } from '@/config/messenger';
 import { getServerDB } from '@/database/core/db-adaptor';
 import { AgentBotProviderModel } from '@/database/models/agentBotProvider';
 import { KeyVaultsGateKeeper } from '@/server/modules/KeyVaultsEncrypt';
+import {
+  getInstallationStore,
+  messengerConnectionIdForUser,
+} from '@/server/services/messenger/installations';
+import { messengerPlatformRegistry } from '@/server/services/messenger/platforms';
 
+import {
+  type BotRuntimeStatus,
+  type BotRuntimeStatusSnapshot,
+} from '../../../types/botRuntimeStatus';
 import type { ConnectionMode } from '../bot/platforms';
-import { getEffectiveConnectionMode, platformRegistry } from '../bot/platforms';
+import { platformRegistry, resolveConnectionMode } from '../bot/platforms';
 import { BOT_CONNECT_QUEUE_EXPIRE_MS, BotConnectQueue } from './botConnectQueue';
 import { createGatewayManager, getGatewayManager } from './GatewayManager';
-import { getMessageGatewayClient } from './MessageGatewayClient';
-import { BOT_RUNTIME_STATUSES, updateBotRuntimeStatus } from './runtimeStatus';
+import {
+  getMessageGatewayClient,
+  type MessageGatewayConnectionStatus,
+} from './MessageGatewayClient';
+import { BOT_RUNTIME_STATUSES, getBotRuntimeStatus, updateBotRuntimeStatus } from './runtimeStatus';
+
+/**
+ * Per-user messenger gateway connections live on the gateway as webhook-mode
+ * DOs that only exist to receive `startTyping` / `stopTyping`. We keep an
+ * in-process map of `connectionId → expireAt` so a hot conversation only
+ * triggers one `client.connect` per process per TTL window. LRU cap defends
+ * against unbounded growth in a long-running replica with a wide active set.
+ *
+ * Module-scoped (not instance-scoped) because `new GatewayService()` is built
+ * fresh on every call site — instance state would defeat the cache.
+ */
+const USER_MESSENGER_CONN_TTL_MS = 30 * 60 * 1000;
+const USER_MESSENGER_CONN_LRU_CAPACITY = 5000;
+const userMessengerConnections = new Map<string, number>();
+
+function mapGatewayStatusToRuntimeStatus(
+  status: MessageGatewayConnectionStatus['state']['status'],
+): BotRuntimeStatus {
+  switch (status) {
+    case 'connected': {
+      return BOT_RUNTIME_STATUSES.connected;
+    }
+    case 'connecting': {
+      return BOT_RUNTIME_STATUSES.starting;
+    }
+    case 'disconnected': {
+      return BOT_RUNTIME_STATUSES.disconnected;
+    }
+    case 'dormant': {
+      return BOT_RUNTIME_STATUSES.dormant;
+    }
+    case 'error': {
+      return BOT_RUNTIME_STATUSES.failed;
+    }
+  }
+}
 
 const log = debug('lobe-server:service:gateway');
 
@@ -93,7 +142,7 @@ export class GatewayService {
         for (const provider of providers) {
           try {
             const definition = platformRegistry.getPlatform(platform);
-            const connectionMode = getEffectiveConnectionMode(definition, provider.settings);
+            const connectionMode = resolveConnectionMode(definition, provider.settings);
 
             // Webhook-mode platforms don't need persistent gateway connections.
             // The webhook URL is set once when the user saves the bot config
@@ -109,6 +158,14 @@ export class GatewayService {
               if (status.state.status === 'connected' || status.state.status === 'connecting') {
                 skippedConnected++;
                 log('Gateway sync: %s already %s, skipping', provider.id, status.state.status);
+                continue;
+              }
+              // Dormant: gateway is running sparse alarm-driven polling and will
+              // self-wake when a message arrives. Reconnecting here would defeat
+              // the purpose — only manual reconnect (startClient) should override.
+              if (status.state.status === 'dormant') {
+                skippedConnected++;
+                log('Gateway sync: %s dormant, skipping (DO is sparse-polling)', provider.id);
                 continue;
               }
               // "error" means credential/config issue (e.g. session expired, unauthorized).
@@ -208,7 +265,7 @@ export class GatewayService {
       const model = new AgentBotProviderModel(serverDB, userId, gateKeeper);
       const provider = await model.findEnabledByApplicationId(platform, applicationId);
 
-      const connectionMode = getEffectiveConnectionMode(definition, provider?.settings);
+      const connectionMode = resolveConnectionMode(definition, provider?.settings);
 
       if (connectionMode !== 'webhook') {
         // Persistent platforms (e.g. Discord gateway or WeChat long-polling) cannot run in a
@@ -247,6 +304,93 @@ export class GatewayService {
     return 'started';
   }
 
+  /**
+   * Pull live status from the gateway for every enabled provider under an
+   * agent and persist each result to Redis. No-op when the gateway is
+   * disabled; webhook-mode providers are skipped (they have no persistent
+   * gateway connection to query).
+   */
+  async refreshBotRuntimeStatusesByAgent(agentId: string, userId: string): Promise<void> {
+    if (!this.useMessageGateway) return;
+
+    const serverDB = await getServerDB();
+    const gateKeeper = await KeyVaultsGateKeeper.initWithEnvKey();
+    const model = new AgentBotProviderModel(serverDB, userId, gateKeeper);
+    const providers = await model.findByAgentId(agentId);
+    const client = getMessageGatewayClient();
+
+    await Promise.all(
+      providers.map(async (provider) => {
+        if (!provider.enabled) return;
+
+        const definition = platformRegistry.getPlatform(provider.platform);
+        const connectionMode = resolveConnectionMode(definition, provider.settings);
+        if (connectionMode === 'webhook') return;
+
+        try {
+          const { state } = await client.getStatus(provider.id);
+          await updateBotRuntimeStatus({
+            applicationId: provider.applicationId,
+            errorMessage: state.error,
+            platform: provider.platform,
+            status: mapGatewayStatusToRuntimeStatus(state.status),
+          });
+        } catch (err) {
+          log(
+            'Bulk refresh: gateway status failed %s:%s: %O',
+            provider.platform,
+            provider.applicationId,
+            err,
+          );
+        }
+      }),
+    );
+  }
+
+  /**
+   * Pull the live connection status from the external message-gateway and
+   * persist it to the local Redis snapshot. When the gateway is disabled or
+   * the provider runs in webhook mode, returns the cached snapshot as-is.
+   */
+  async refreshBotRuntimeStatus(
+    platform: string,
+    applicationId: string,
+    userId: string,
+  ): Promise<BotRuntimeStatusSnapshot> {
+    const cached = await getBotRuntimeStatus(platform, applicationId);
+
+    if (!this.useMessageGateway) return cached;
+
+    const serverDB = await getServerDB();
+    const gateKeeper = await KeyVaultsGateKeeper.initWithEnvKey();
+    const model = new AgentBotProviderModel(serverDB, userId, gateKeeper);
+    const provider = await model.findEnabledByApplicationId(platform, applicationId);
+
+    if (!provider) return cached;
+
+    const definition = platformRegistry.getPlatform(platform);
+    const connectionMode = resolveConnectionMode(definition, provider.settings);
+
+    // Webhook-mode bots have no persistent gateway connection to query — the
+    // gateway only holds the webhook URL registration, so the local snapshot
+    // is already the source of truth.
+    if (connectionMode === 'webhook') return cached;
+
+    const client = getMessageGatewayClient();
+    try {
+      const { state } = await client.getStatus(provider.id);
+      return await updateBotRuntimeStatus({
+        applicationId,
+        errorMessage: state.error,
+        platform,
+        status: mapGatewayStatusToRuntimeStatus(state.status),
+      });
+    } catch (err) {
+      log('Refresh runtime status via gateway failed %s:%s: %O', platform, applicationId, err);
+      return cached;
+    }
+  }
+
   async stopClient(platform: string, applicationId: string, userId?: string): Promise<void> {
     if (this.useMessageGateway) {
       return this.stopClientViaGateway(platform, applicationId);
@@ -264,9 +408,9 @@ export class GatewayService {
         const gateKeeper = await KeyVaultsGateKeeper.initWithEnvKey();
         const model = new AgentBotProviderModel(serverDB, userId, gateKeeper);
         const provider = await model.findEnabledByApplicationId(platform, applicationId);
-        connectionMode = getEffectiveConnectionMode(definition, provider?.settings);
+        connectionMode = resolveConnectionMode(definition, provider?.settings);
       } else {
-        connectionMode = getEffectiveConnectionMode(definition, undefined);
+        connectionMode = resolveConnectionMode(definition, undefined);
       }
 
       if (connectionMode !== 'webhook') {
@@ -286,6 +430,108 @@ export class GatewayService {
       platform,
       status: BOT_RUNTIME_STATUSES.disconnected,
     });
+  }
+
+  /**
+   * Lazy-register a per-user messenger connection on the gateway and return
+   * the connectionId. Idempotent within the in-process LRU TTL — repeat calls
+   * skip the network round-trip.
+   *
+   * Returns null when:
+   *  - the gateway is disabled (`MESSAGE_GATEWAY_ENABLED !== '1'`)
+   *  - the installation store can't resolve credentials for the given key
+   *  - the gateway connect call throws (best-effort: messenger typing is a
+   *    UX nicety, never block the agent run)
+   *
+   * Slack token rotation is handled passively by the LRU TTL: when a stale
+   * cached entry expires, the next call re-resolves credentials via
+   * `resolveByKey` (which transparently refreshes Slack OAuth) and pushes the
+   * fresh token to the gateway via a fresh `connect`. The DO upserts on
+   * connectionId so this is non-disruptive.
+   */
+  async ensureUserMessengerConnected(params: {
+    installationKey: string;
+    platform: MessengerPlatform;
+    userId: string;
+  }): Promise<string | null> {
+    if (!this.useMessageGateway) return null;
+
+    const { installationKey, platform, userId } = params;
+
+    // Websocket-mode singleton platforms (Discord SystemBot today): the WS
+    // is registered by dc-center at `messenger:<platform>:singleton` and
+    // there is no per-user DO to register here. Route typing to the
+    // singleton connectionId directly — opening a per-user webhook DO would
+    // (a) be rejected by the gateway and (b) not be where `triggerTyping`
+    // can actually fire, since only the singleton WS holds the live socket.
+    //
+    // SystemBot's transport is fixed per platform (e.g. Slack SystemBot is
+    // webhook even though a per-agent bot-channel Slack provider may run
+    // Socket Mode/websocket), so it lives on the messenger definition, not
+    // the bot-channel one.
+    const connectionMode = messengerPlatformRegistry.getPlatform(platform)?.connectionMode;
+    if (connectionMode === 'websocket') {
+      return messengerConnectionIdForUser({ connectionMode, installationKey, userId });
+    }
+
+    const connectionId = messengerConnectionIdForUser({ connectionMode, installationKey, userId });
+
+    const now = Date.now();
+    const expireAt = userMessengerConnections.get(connectionId);
+    if (expireAt && expireAt > now) {
+      // Re-touch on hit so the LRU eviction order tracks recency.
+      userMessengerConnections.delete(connectionId);
+      userMessengerConnections.set(connectionId, expireAt);
+      return connectionId;
+    }
+
+    const store = getInstallationStore(platform);
+    if (!store) {
+      log('ensureUserMessengerConnected: no installation store for platform=%s', platform);
+      return null;
+    }
+
+    const creds = await store.resolveByKey(installationKey);
+    if (!creds?.botToken) {
+      log(
+        'ensureUserMessengerConnected: missing creds for key=%s (user=%s)',
+        installationKey,
+        userId,
+      );
+      return null;
+    }
+
+    try {
+      const client = getMessageGatewayClient();
+      await client.connect({
+        applicationId: creds.applicationId,
+        connectionId,
+        // The user DO is purely an outbound surface for typing; no inbound
+        // events come back through this connection. Webhook mode prevents the
+        // gateway from opening per-user persistent connections (Telegram /
+        // Slack inbound already arrives at lobehub directly via webhooks;
+        // Discord inbound stays on the singleton WS).
+        connectionMode: 'webhook',
+        credentials: { botToken: creds.botToken },
+        platform,
+        userId,
+        webhookPath: '',
+      });
+
+      // Evict-on-add: the iterator yields keys in insertion order, so the
+      // first key is the oldest entry.
+      if (userMessengerConnections.size >= USER_MESSENGER_CONN_LRU_CAPACITY) {
+        const oldest = userMessengerConnections.keys().next().value;
+        if (oldest !== undefined) userMessengerConnections.delete(oldest);
+      }
+      userMessengerConnections.set(connectionId, now + USER_MESSENGER_CONN_TTL_MS);
+
+      log('ensureUserMessengerConnected: registered %s', connectionId);
+      return connectionId;
+    } catch (err) {
+      log('ensureUserMessengerConnected: connect failed for %s: %O', connectionId, err);
+      return null;
+    }
   }
 
   // ─── External Message Gateway ───
@@ -312,7 +558,7 @@ export class GatewayService {
     }
 
     const definition = platformRegistry.getPlatform(platform);
-    const connectionMode = getEffectiveConnectionMode(definition, provider.settings);
+    const connectionMode = resolveConnectionMode(definition, provider.settings);
 
     // Webhook-mode platforms don't need persistent gateway connections.
     // Run the platform client locally via GatewayManager so each platform can

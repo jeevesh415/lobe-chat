@@ -9,6 +9,7 @@ import {
 } from '../store/remote-store';
 import type { ExecutionSnapshot, StepSnapshot } from '../types';
 import {
+  renderAgentSignal,
   renderDiff,
   renderEnvContext,
   renderMemory,
@@ -18,6 +19,7 @@ import {
   renderSnapshot,
   renderStepDetail,
   renderSystemRole,
+  resolveCeSnapshot,
 } from '../viewer';
 
 async function fetchSnapshotFromUrl(url: string): Promise<ExecutionSnapshot> {
@@ -43,8 +45,8 @@ function findStep(snapshot: ExecutionSnapshot, stepIndex: number): StepSnapshot 
   return step;
 }
 
-function getSystemRole(step: StepSnapshot): string | undefined {
-  const ceEvent = step.events?.find((e) => e.type === 'context_engine_result') as any;
+function getSystemRole(step: StepSnapshot, allSteps?: StepSnapshot[]): string | undefined {
+  const ceEvent = resolveCeSnapshot(step, allSteps) as any;
   const inputRole = ceEvent?.input?.systemRole;
   if (inputRole) return inputRole;
   const outputMsgs = ceEvent?.output as any[] | undefined;
@@ -55,8 +57,8 @@ function getSystemRole(step: StepSnapshot): string | undefined {
     : JSON.stringify(systemMsg.content, null, 2);
 }
 
-function getEnvContent(step: StepSnapshot): string | undefined {
-  const ceEvent = step.events?.find((e) => e.type === 'context_engine_result') as any;
+function getEnvContent(step: StepSnapshot, allSteps?: StepSnapshot[]): string | undefined {
+  const ceEvent = resolveCeSnapshot(step, allSteps) as any;
   const outputMsgs = ceEvent?.output as any[] | undefined;
   const envMsg = outputMsgs?.find((m: any) => m.role === 'user');
   if (!envMsg) return undefined;
@@ -89,6 +91,7 @@ export function registerInspectCommand(program: Command) {
     .option('-d, --diff <n>', 'Diff against step N (use with -r or --env)')
     .option('-T, --payload-tools', 'List available tools registered in LLM payload')
     .option('-M, --memory', 'Show full user memory content (default step 0)')
+    .option('-S, --agent-signal', 'Show local agent-signal chain analysis')
     .option(
       '-p, --payload',
       'Show context engine input overview (knowledge, memory, capabilities, etc.)',
@@ -98,6 +101,7 @@ export function registerInspectCommand(program: Command) {
       async (
         traceId: string | undefined,
         opts: {
+          agentSignal?: boolean;
           context?: boolean;
           diff?: string;
           env?: boolean;
@@ -161,6 +165,16 @@ export function registerInspectCommand(program: Command) {
           process.exit(1);
         }
 
+        if (opts.agentSignal) {
+          if (opts.json) {
+            const { analyzeAgentSignal } = await import('../viewer/agentSignal');
+            console.log(JSON.stringify(analyzeAgentSignal(snapshot), null, 2));
+          } else {
+            console.log(renderAgentSignal(snapshot));
+          }
+          return;
+        }
+
         const stepIndex = opts.step !== undefined ? Number.parseInt(opts.step, 10) : undefined;
 
         // -r / --env / -T / -p default to step 0
@@ -182,8 +196,12 @@ export function registerInspectCommand(program: Command) {
           const stepA = findStep(snapshot, effectiveStepIndex);
           const stepB = findStep(snapshot, diffStepIndex);
           const label = opts.systemRole ? 'System Role' : 'Environment Context';
-          const contentA = opts.systemRole ? getSystemRole(stepA) : getEnvContent(stepA);
-          const contentB = opts.systemRole ? getSystemRole(stepB) : getEnvContent(stepB);
+          const contentA = opts.systemRole
+            ? getSystemRole(stepA, snapshot.steps)
+            : getEnvContent(stepA, snapshot.steps);
+          const contentB = opts.systemRole
+            ? getSystemRole(stepB, snapshot.steps)
+            : getEnvContent(stepB, snapshot.steps);
           console.log(
             renderDiff(contentA ?? '', contentB ?? '', {
               labelA: `Step ${effectiveStepIndex}`,
@@ -199,14 +217,18 @@ export function registerInspectCommand(program: Command) {
           const step = findStep(snapshot, effectiveStepIndex);
           if (opts.json) {
             if (opts.systemRole) {
-              console.log(JSON.stringify(getSystemRole(step) ?? null, null, 2));
+              console.log(JSON.stringify(getSystemRole(step, snapshot.steps) ?? null, null, 2));
             } else {
-              const ceEvent = step.events?.find((e) => e.type === 'context_engine_result') as any;
+              const ceEvent = resolveCeSnapshot(step, snapshot.steps) as any;
               const envMsg = (ceEvent?.output as any[])?.find((m: any) => m.role === 'user');
               console.log(JSON.stringify(envMsg ?? null, null, 2));
             }
           } else {
-            console.log(opts.systemRole ? renderSystemRole(step) : renderEnvContext(step));
+            console.log(
+              opts.systemRole
+                ? renderSystemRole(step, snapshot.steps)
+                : renderEnvContext(step, snapshot.steps),
+            );
           }
           return;
         }
@@ -215,12 +237,12 @@ export function registerInspectCommand(program: Command) {
         if (opts.payloadTools && effectiveStepIndex !== undefined) {
           const step = findStep(snapshot, effectiveStepIndex);
           if (opts.json) {
-            const ceEvent = step.events?.find((e) => e.type === 'context_engine_result') as any;
+            const ceEvent = resolveCeSnapshot(step, snapshot.steps) as any;
             const toolsConfig = ceEvent?.input?.toolsConfig;
             const payloadTools = (step.context?.payload as any)?.tools;
             console.log(JSON.stringify({ payloadTools, toolsConfig }, null, 2));
           } else {
-            console.log(renderPayloadTools(step));
+            console.log(renderPayloadTools(step, snapshot.steps));
           }
           return;
         }
@@ -229,10 +251,10 @@ export function registerInspectCommand(program: Command) {
         if (opts.payload && effectiveStepIndex !== undefined) {
           const step = findStep(snapshot, effectiveStepIndex);
           if (opts.json) {
-            const ceEvent = step.events?.find((e) => e.type === 'context_engine_result') as any;
+            const ceEvent = resolveCeSnapshot(step, snapshot.steps) as any;
             console.log(JSON.stringify(ceEvent?.input ?? null, null, 2));
           } else {
-            console.log(renderPayload(step));
+            console.log(renderPayload(step, snapshot.steps));
           }
           return;
         }
@@ -241,10 +263,10 @@ export function registerInspectCommand(program: Command) {
         if (opts.memory && effectiveStepIndex !== undefined) {
           const step = findStep(snapshot, effectiveStepIndex);
           if (opts.json) {
-            const ceEvent = step.events?.find((e) => e.type === 'context_engine_result') as any;
+            const ceEvent = resolveCeSnapshot(step, snapshot.steps) as any;
             console.log(JSON.stringify(ceEvent?.input?.userMemory ?? null, null, 2));
           } else {
-            console.log(renderMemory(step));
+            console.log(renderMemory(step, snapshot.steps));
           }
           return;
         }

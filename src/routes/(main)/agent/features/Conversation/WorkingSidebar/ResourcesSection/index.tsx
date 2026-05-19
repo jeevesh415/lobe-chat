@@ -1,39 +1,36 @@
-import { Accordion, AccordionItem, Flexbox, Text } from '@lobehub/ui';
+import { Flexbox } from '@lobehub/ui';
 import { memo } from 'react';
-import { useTranslation } from 'react-i18next';
+
+import { useAgentStore } from '@/store/agent';
+import { agentByIdSelectors, agentSelectors } from '@/store/agent/selectors';
+import { useChatStore } from '@/store/chat';
+import { topicSelectors } from '@/store/chat/selectors';
 
 import AgentDocumentsGroup from './AgentDocumentsGroup';
+import SkillsGroup from './SkillsGroup';
 
-interface ResourcesSectionProps {
-  onSelectDocument: (id: string | null) => void;
-  selectedDocumentId: string | null;
-}
+export type ResourceViewMode = 'list' | 'tree';
 
-const ResourcesSection = memo<ResourcesSectionProps>(({ onSelectDocument, selectedDocumentId }) => {
-  const { t } = useTranslation('chat');
+const ResourcesSection = memo(() => {
+  const isHetero = useAgentStore(agentSelectors.isCurrentAgentHeterogeneous);
+  const activeAgentId = useAgentStore((s) => s.activeAgentId);
+  const agentWorkingDirectory = useAgentStore((s) =>
+    activeAgentId ? agentByIdSelectors.getAgentWorkingDirectoryById(activeAgentId)(s) : undefined,
+  );
+  const topicWorkingDirectory = useChatStore(topicSelectors.currentTopicWorkingDirectory);
+  const workingDirectory = topicWorkingDirectory || agentWorkingDirectory;
 
   return (
-    <Flexbox data-testid="workspace-resources" padding={16}>
-      <Accordion defaultExpandedKeys={['resources']} gap={0}>
-        <AccordionItem
-          itemKey={'resources'}
-          paddingBlock={2}
-          paddingInline={6}
-          title={<Text strong>{t('workingPanel.resources')}</Text>}
-          styles={{
-            header: {
-              width: 'fit-content',
-            },
-          }}
-        >
-          <Flexbox paddingBlock={8}>
-            <AgentDocumentsGroup
-              selectedDocumentId={selectedDocumentId}
-              onSelectDocument={onSelectDocument}
-            />
-          </Flexbox>
-        </AccordionItem>
-      </Accordion>
+    <Flexbox
+      data-testid="workspace-resources"
+      flex={1}
+      gap={16}
+      paddingBlock={8}
+      paddingInline={'8px 12px'}
+      style={{ minHeight: 0 }}
+    >
+      {isHetero && workingDirectory && <SkillsGroup workingDirectory={workingDirectory} />}
+      {!isHetero && <AgentDocumentsGroup style={{ flex: 1, minHeight: 0 }} viewMode={'list'} />}
     </Flexbox>
   );
 });

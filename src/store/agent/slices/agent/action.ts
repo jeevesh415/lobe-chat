@@ -93,7 +93,6 @@ export class AgentSliceActionImpl {
           agent_id: result.agentId,
           assistant_name: params.config?.title || 'Untitled Agent',
           assistant_tags: params.config?.tags || [],
-          session_id: result.sessionId,
           user_id: userId || 'anonymous',
         },
       });
@@ -286,6 +285,30 @@ export class AgentSliceActionImpl {
           if (!data) return;
           this.#get().internal_dispatchAgentMap(agentId, data);
           this.#set({ activeAgentId: data.id }, false, 'fetchAgentConfig');
+        },
+      },
+    );
+  };
+
+  useHydrateAgentConfig = (
+    isLogin: boolean | undefined,
+    agentId: string,
+  ): SWRResponse<LobeAgentConfig> => {
+    const swrKey =
+      isLogin === true && agentId && !isChatGroupSessionId(agentId)
+        ? ([FETCH_AGENT_CONFIG_KEY, agentId] as const)
+        : null;
+
+    return useClientDataSWRWithSync<LobeAgentConfig>(
+      swrKey,
+      async () => {
+        const data = await agentService.getAgentConfigById(agentId);
+        return data as LobeAgentConfig;
+      },
+      {
+        onData: (data) => {
+          if (!data) return;
+          this.#get().internal_dispatchAgentMap(agentId, data);
         },
       },
     );

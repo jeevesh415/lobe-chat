@@ -1,7 +1,9 @@
+import { isDesktop } from '@lobechat/const';
+import { HETEROGENEOUS_AGENT_CLIENT_CONFIGS } from '@lobechat/heterogeneous-agents/client';
 import { Icon } from '@lobehub/ui';
 import { GroupBotSquareIcon } from '@lobehub/ui/icons';
 import { App } from 'antd';
-import { type ItemType } from 'antd/es/menu/interface';
+import type { ItemType } from 'antd/es/menu/interface';
 import { BotIcon, FileTextIcon, FolderCogIcon, FolderPlus } from 'lucide-react';
 import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -10,9 +12,10 @@ import useSWRMutation from 'swr/mutation';
 
 import { useGroupTemplates } from '@/components/ChatGroupWizard/templates';
 import { DEFAULT_CHAT_GROUP_CHAT_CONFIG } from '@/const/settings';
+import { useCreateHeteroAgent } from '@/hooks/useCreateHeteroAgent';
 import { useOptionalAgentModal } from '@/routes/(main)/home/_layout/Body/Agent/ModalProvider';
-import { type CreateAgentParams } from '@/services/agent';
-import { type GroupMemberConfig } from '@/services/chatGroup';
+import type { CreateAgentParams } from '@/services/agent';
+import type { GroupMemberConfig } from '@/services/chatGroup';
 import { chatGroupService } from '@/services/chatGroup';
 import { useAgentStore } from '@/store/agent';
 import { useAgentGroupStore } from '@/store/agentGroup';
@@ -44,6 +47,7 @@ export const useCreateMenuItems = () => {
   ]);
   const [createGroup, loadGroups] = useAgentGroupStore((s) => [s.createGroup, s.loadGroups]);
   const createNewPage = usePageStore((s) => s.createNewPage);
+  const createHeterogeneousAgent = useCreateHeteroAgent();
 
   const [isCreatingGroup, setIsCreatingGroup] = useState(false);
   const [isCreatingSessionGroup, setIsCreatingSessionGroup] = useState(false);
@@ -205,16 +209,38 @@ export const useCreateMenuItems = () => {
       label: t('newAgent'),
       onClick: async (info) => {
         info.domEvent?.stopPropagation();
-        if (options?.groupId) {
-          await createAgent(options);
-        } else if (openCreateModal) {
-          openCreateModal('agent');
+        if (openCreateModal) {
+          openCreateModal('agent', options?.groupId ? { groupId: options.groupId } : undefined);
         } else {
           await createAgent(options);
         }
       },
     }),
     [t, createAgent, openCreateModal],
+  );
+
+  /**
+   * Create heterogeneous agent menu items (Desktop only)
+   */
+  const createHeterogeneousAgentMenuItems = useCallback(
+    (options?: CreateAgentOptions): ItemType[] => {
+      if (!isDesktop) return [];
+
+      return HETEROGENEOUS_AGENT_CLIENT_CONFIGS.map((definition) => {
+        const AgentIcon = definition.icon;
+
+        return {
+          icon: <AgentIcon size={'1em'} />,
+          key: definition.menuKey,
+          label: t(definition.menuLabelKey),
+          onClick: async (info) => {
+            info.domEvent?.stopPropagation();
+            await createHeterogeneousAgent(definition, options);
+          },
+        };
+      });
+    },
+    [t, createHeterogeneousAgent],
   );
 
   /**
@@ -228,10 +254,8 @@ export const useCreateMenuItems = () => {
       label: t('newGroupChat'),
       onClick: async (info) => {
         info.domEvent?.stopPropagation();
-        if (options?.groupId) {
-          await createEmptyGroup(options);
-        } else if (openCreateModal) {
-          openCreateModal('group');
+        if (openCreateModal) {
+          openCreateModal('group', options?.groupId ? { groupId: options.groupId } : undefined);
         } else {
           await createEmptyGroup(options);
         }
@@ -311,6 +335,8 @@ export const useCreateMenuItems = () => {
     createEmptyGroup,
     createGroupChatMenuItem,
     createGroupFromTemplate,
+    createHeterogeneousAgent,
+    createHeterogeneousAgentMenuItems,
     createGroupWithMembers,
     createPage,
     createPageMenuItem,
